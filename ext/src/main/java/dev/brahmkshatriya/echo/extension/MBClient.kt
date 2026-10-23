@@ -65,12 +65,12 @@ class MBClient(
 
                 if (resp == null) return@withLock null
                 if (resp.code == 503) {
-                    mbLog("503 (rate limit o User-Agent), tentativo ${attempt + 1}/$MAX_ATTEMPTS")
+                    mbLog("503 (rate limit or User-Agent), attempt ${attempt + 1}/$MAX_ATTEMPTS")
                     delay(2_000L * (attempt + 1))
                     continue
                 }
                 val text = resp.body ?: run {
-                    mbLog("HTTP ${resp.code} per $path")
+                    mbLog("HTTP ${resp.code} for $path")
                     return@withLock null
                 }
                 val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()

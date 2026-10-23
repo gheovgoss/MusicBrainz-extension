@@ -2,7 +2,6 @@ package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
-import dev.brahmkshatriya.echo.common.models.Date
 import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.NetworkRequest
 import dev.brahmkshatriya.echo.common.models.Shelf
@@ -14,9 +13,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
 
-// ---------------------------------------------------------------------------
 // Helper JSON
-// ---------------------------------------------------------------------------
 
 fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.contentOrNull
 fun JsonObject.arr(key: String): JsonArray = this[key] as? JsonArray ?: JsonArray(emptyList())
@@ -77,6 +74,18 @@ fun JsonObject.toAlbum(): Album? {
         isRadioSupported = false,
         isSaveable = false,
     )
+}
+
+suspend fun MBClient.recordingsByMbids(mbids: List<String>): List<Track> {
+    if (mbids.isEmpty()) return emptyList()
+    val res = get(
+        "recording",
+        mapOf("query" to "rid:(${mbids.joinToString(" OR ")})", "limit" to mbids.size.toString())
+    ) ?: return emptyList()
+    val byId = res.arr("recordings")
+        .mapNotNull { (it as? JsonObject)?.toTrack() }
+        .associateBy { it.id }
+    return mbids.mapNotNull { byId[it] }
 }
 
 fun JsonObject.toTrack(): Track? {

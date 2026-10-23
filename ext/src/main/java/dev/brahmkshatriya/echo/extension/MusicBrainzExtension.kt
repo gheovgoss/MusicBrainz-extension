@@ -26,6 +26,8 @@ import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -37,8 +39,9 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     companion object {
         const val KEY_API_URL = "api_url"
         const val DEFAULT_API_URL = "https://api.listenbrainz.org"
-
         const val KEY_CONTACT = "contact"
+        const val STATS_RANGE = "month"
+        const val KEY_MOCK = "mock_home"
 
     }
 
@@ -56,11 +59,18 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL),
 
         SettingTextInput("Contact (email or URL)", KEY_CONTACT, "Sent to MusicBrainz in the User-Agent, as they require", ""),
+
+        SettingSwitch(
+            "Mock data", KEY_MOCK,
+            "Developer setting for MusicBrainz, leave this to false", false
+        ),
     )
 
     override fun setSettings(settings: Settings) { this.settings = settings }
 
     private fun apiRoot() = settings.getString(KEY_API_URL)?.trim()?.trimEnd('/')?.ifEmpty { null } ?: DEFAULT_API_URL
+
+    private fun mockEnabled() = settings.getBoolean(KEY_MOCK) ?: false
 
 
     // --- Login---
@@ -171,25 +181,67 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     // --- Home ---
 
     override suspend fun loadHomeFeed(): Feed<Shelf> =
-        PagedData.Single<Shelf> { homeShelves() }.toFeed()
+        PagedData.Single { homeShelves() }.toFeed()
 
-    private suspend fun homeShelves(): List<Shelf> {
-        val user = currentUser?.id ?: return emptyList()
-        val url = apiRoot().toHttpUrl().newBuilder()
-            .addPathSegments("1/user")
-            .addPathSegment(user)
-            .addPathSegment("listens")
-            .addQueryParameter("count", "50")
-            .build()
+    private fun lbUrl(vararg segments: String, params: Map<String, String> = emptyMap()): HttpUrl =
+        apiRoot().toHttpUrl().newBuilder().apply {
+            segments.forEach { addPathSegment(it) }
+            params.forEach { (k, v) -> addQueryParameter(k, v) }
+        }.build()
 
-        val recent = lbGet(url)?.obj("payload")?.arr("listens")
-            ?.mapNotNull { (it as? JsonObject)?.listenToTrack() }
-            .orEmpty()
+    private suspend fun homeShelves(): List<Shelf> = coroutineScope {
+        val user = currentUser?.id ?: return@coroutineScope emptyList()
+        val real = linkedMapOf<String, Shelf>()
 
-        return buildList {
-            if (recent.isNotEmpty())
-                add(Shelf.Lists.Tracks(id = "recent", title = "Ascoltate di recente", list = recent))
+        val recent = async {
+            lbGet(lbUrl("1", "user", user, "listens", params = mapOf("count" to "50")))
+                ?.obj("payload")?.arr("listens")
+                ?.mapNotNull { (it as? JsonObject)?.listenToTrack() }.orEmpty()
         }
+        val topArtists = async {
+            lbGet(lbUrl("1", "stats", "user", user, "artists",
+                params = mapOf("range" to STATS_RANGE, "count" to "20")))
+                ?.obj("payload")?.arr("artists")
+                ?.mapNotNull { (it as? JsonObject)?.statArtist() }.orEmpty()
+        }
+        val topAlbums = async {
+            lbGet(lbUrl("1", "stats", "user", user, "release-groups",
+                params = mapOf("range" to STATS_RANGE, "count" to "20")))
+                ?.obj("payload")?.arr("release_groups")
+                ?.mapNotNull { (it as? JsonObject)?.statAlbum() }.orEmpty()
+        }
+        val fresh = async {
+            lbGet(lbUrl("1", "user", user, "fresh_releases",
+                params = mapOf("days" to "30", "future" to "false", "sort" to "release_date")))
+                ?.obj("payload")?.arr("releases")
+                ?.mapNotNull { (it as? JsonObject)?.freshAlbum() }?.take(20).orEmpty()
+        }
+        val recs = async {
+            val mbids = lbGet(lbUrl("1", "cf", "recommendation", "user", user, "recording",
+                params = mapOf("count" to "20")))
+                ?.obj("payload")?.arr("mbids")
+                ?.mapNotNull { (it as? JsonObject)?.get("recording_mbid").str() }.orEmpty()
+            mb.recordingsByMbids(mbids)
+        }
+
+        fun tracks(id: String, l: List<Track>) {
+            if (l.isNotEmpty()) real[id] = Shelf.Lists.Tracks(id = id, title = HOME_TITLES.getValue(id), list = l)
+        }
+        tracks("recent", recent.await())
+        tracks("recs", recs.await())
+        topArtists.await().takeIf { it.isNotEmpty() }?.let {
+            real["top_artists"] = Shelf.Lists.Items(id = "top_artists", title = HOME_TITLES.getValue("top_artists"), list = it)
+        }
+        topAlbums.await().takeIf { it.isNotEmpty() }?.let {
+            real["top_albums"] = Shelf.Lists.Items(id = "top_albums", title = HOME_TITLES.getValue("top_albums"), list = it)
+        }
+        fresh.await().takeIf { it.isNotEmpty() }?.let {
+            real["fresh"] = Shelf.Lists.Items(id = "fresh", title = HOME_TITLES.getValue("fresh"), list = it)
+        }
+        if (!mockEnabled()) return@coroutineScope real.values.toList()
+
+        val mock = mb.mockHomeShelves()
+        HOME_ORDER.mapNotNull { real[it] ?: mock[it] }
     }
 
     private suspend fun lbGet(url: HttpUrl): JsonObject? = try {

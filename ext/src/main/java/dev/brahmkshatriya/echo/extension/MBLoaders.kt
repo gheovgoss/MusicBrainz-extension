@@ -17,21 +17,13 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import java.net.URLEncoder
 
-// Usa gli helper di MbMapper.kt (str, arr, obj, cover, artistsOf): devono essere `internal`.
-
-// ---------------------------------------------------------------------------
-// Date: "YYYY", "YYYY-MM" o "YYYY-MM-DD" -> Date di Echo
-// ---------------------------------------------------------------------------
-
 fun String?.toEchoDate(): Date? {
     val p = this?.split('-') ?: return null
     val year = p.getOrNull(0)?.toIntOrNull() ?: return null
     return Date(year, p.getOrNull(1)?.toIntOrNull(), p.getOrNull(2)?.toIntOrNull())
 }
 
-// ---------------------------------------------------------------------------
 // Album
-// ---------------------------------------------------------------------------
 
 private class AlbumData(
     val tracks: List<Track>,
@@ -73,14 +65,13 @@ private fun releaseTracks(rel: JsonObject, album: Album): List<Track> {
                 isRadioSupported = false,
                 isSaveable = false,
                 isHideable = false,
-                isLikeable = false, // da portare a true con LikeClient
+                isLikeable = false,
             )
         }
     }
     return out
 }
 
-/** Due richieste (release-group + release): la seconda chiamata a loadTracks arriva dalla cache. */
 private suspend fun MBClient.albumData(album: Album): AlbumData? {
     val rg = get("release-group/${album.id}", mapOf("inc" to "artist-credits+releases")) ?: return null
     val relId = pickRelease(rg.arr("releases")) ?: return null
@@ -114,9 +105,7 @@ suspend fun MBClient.loadAlbumDetails(album: Album): Album {
 
 suspend fun MBClient.albumTracks(album: Album): List<Track> = albumData(album)?.tracks.orEmpty()
 
-// ---------------------------------------------------------------------------
 // Artists
-// ---------------------------------------------------------------------------
 
 suspend fun MBClient.loadArtistDetails(artist: Artist): Artist {
     if (artist.extras["mbid"] == null) return artist
@@ -161,7 +150,7 @@ private fun bucketOf(rg: JsonObject): String {
     return when {
         "Live" in secondary -> "live"
         "Compilation" in secondary -> "compilation"
-        secondary.isNotEmpty() -> "other" // Remix, Soundtrack, DJ-mix, Demo, ...
+        secondary.isNotEmpty() -> "other"
         rg["primary-type"].str() == "Album" -> "album"
         rg["primary-type"].str() == "EP" -> "ep"
         rg["primary-type"].str() == "Single" -> "single"
