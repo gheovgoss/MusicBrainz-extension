@@ -1,6 +1,9 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.clients.AlbumClient
+import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
+import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
@@ -14,14 +17,22 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
+import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
+import dev.brahmkshatriya.echo.common.models.Album
+import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
 import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Track
+import okhttp3.HttpUrl
+import kotlin.coroutines.cancellation.CancellationException
 
 private fun lbLog(msg: String) = println("LbExt: $msg")
 
-class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient {
+class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
+    AlbumClient, ArtistClient, TrackClient, HomeFeedClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -128,5 +139,73 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     // --- Search ---
 
     override suspend fun loadSearchFeed(query: String): Feed<Shelf> =
-        PagedData.Single<Shelf> { mb.searchAll(query) }.toFeed()
+        PagedData.Single { mb.searchAll(query) }.toFeed()
+
+    // --- Album ---
+    override suspend fun loadAlbum(album: Album): Album = mb.loadAlbumDetails(album)
+
+    override suspend fun loadTracks(album: Album): Feed<Track> =
+        PagedData.Single { mb.albumTracks(album) }.toFeed()
+
+    override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
+
+    // --- Artist ---
+
+    override suspend fun loadArtist(artist: Artist): Artist = mb.loadArtistDetails(artist)
+
+    override suspend fun loadFeed(artist: Artist): Feed<Shelf> =
+        PagedData.Single { mb.artistShelves(artist) }.toFeed()
+
+    // --- Track ---
+
+    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track =
+        mb.loadTrackDetails(track)
+
+    override suspend fun loadStreamableMedia(
+        streamable: Streamable,
+        isDownload: Boolean,
+    ): Streamable.Media = error("No stream audio from MB")
+
+    override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+
+    // --- Home ---
+
+    override suspend fun loadHomeFeed(): Feed<Shelf> =
+        PagedData.Single<Shelf> { homeShelves() }.toFeed()
+
+    private suspend fun homeShelves(): List<Shelf> {
+        val user = currentUser?.id ?: return emptyList()
+        val url = apiRoot().toHttpUrl().newBuilder()
+            .addPathSegments("1/user")
+            .addPathSegment(user)
+            .addPathSegment("listens")
+            .addQueryParameter("count", "50")
+            .build()
+
+        val recent = lbGet(url)?.obj("payload")?.arr("listens")
+            ?.mapNotNull { (it as? JsonObject)?.listenToTrack() }
+            .orEmpty()
+
+        return buildList {
+            if (recent.isNotEmpty())
+                add(Shelf.Lists.Tracks(id = "recent", title = "Ascoltate di recente", list = recent))
+        }
+    }
+
+    private suspend fun lbGet(url: HttpUrl): JsonObject? = try {
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder().url(url).apply {
+                token?.let { header("Authorization", "Token $it") }
+            }.get().build()
+            http.newCall(req).execute().use {
+                if (it.isSuccessful) it.body.string()
+                else { lbLog("HTTP ${it.code} per $url"); null }
+            }
+        }?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        lbLog("errore: ${e.message}")
+        null
+    }
 }

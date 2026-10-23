@@ -2,6 +2,7 @@ package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
+import dev.brahmkshatriya.echo.common.models.Date
 import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.NetworkRequest
 import dev.brahmkshatriya.echo.common.models.Shelf
@@ -17,16 +18,16 @@ import kotlinx.serialization.json.longOrNull
 // Helper JSON
 // ---------------------------------------------------------------------------
 
-private fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.contentOrNull
-private fun JsonObject.arr(key: String): JsonArray = this[key] as? JsonArray ?: JsonArray(emptyList())
-private fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
+fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.contentOrNull
+fun JsonObject.arr(key: String): JsonArray = this[key] as? JsonArray ?: JsonArray(emptyList())
+fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 
-private fun cover(path: String): ImageHolder =
+fun cover(path: String): ImageHolder =
     ImageHolder.NetworkRequestImageHolder(NetworkRequest(url = "https://coverartarchive.org/$path"), false)
 
 private fun releaseGroupCover(mbid: String) = cover("release-group/$mbid/front-250")
 
-private fun artistsOf(o: JsonObject): List<Artist> =
+fun artistsOf(o: JsonObject): List<Artist> =
     o.arr("artist-credit").mapNotNull { credit ->
         val c = credit as? JsonObject ?: return@mapNotNull null
         val a = c.obj("artist") ?: return@mapNotNull null

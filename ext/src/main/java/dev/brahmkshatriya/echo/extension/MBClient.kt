@@ -91,4 +91,25 @@ class MBClient(
             return Resp(r.code, if (r.isSuccessful) r.body.string() else null)
         }
     }
+
+    suspend fun getExternal(url: String): JsonObject? {
+        synchronized(cache) { cache[url] }?.let { return it }
+        val text = try {
+            withContext(Dispatchers.IO) {
+                val req = Request.Builder().url(url)
+                    .header("User-Agent", userAgent())
+                    .header("Accept", "application/json")
+                    .get().build()
+                http.newCall(req).execute().use { r -> if (r.isSuccessful) r.body.string() else null }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            mbLog("errore esterno: ${e.message}")
+            null
+        } ?: return null
+        val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
+        synchronized(cache) { cache[url] = obj }
+        return obj
+    }
 }
