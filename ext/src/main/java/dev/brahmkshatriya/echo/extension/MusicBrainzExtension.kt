@@ -27,13 +27,17 @@ import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.HttpUrl
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -412,17 +416,74 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         val forYou = fetch("playlists", "createdfor")
         val collab = fetch("playlists", "collaborator")
 
+        val mineList = withCovers(mine.await())
+        val forYouList = withCovers(forYou.await())
+        val collabList = withCovers(collab.await())
+
         buildList {
-            mine.await().takeIf { it.isNotEmpty() }?.let {
-                add(Shelf.Lists.Items(id = "pl_mine", title = "Playlists", list = it))
+            add(
+                Shelf.Category(
+                    id = "taste", title = "Taste", subtitle = "Loved and hated tracks",
+                    feed = PagedData.Single { tasteShelves(user) }.toFeed(),
+                )
+            )
+            mineList.takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Items(id = "pl_mine", title = "Your playlists", list = it))
             }
-            forYou.await().takeIf { it.isNotEmpty() }?.let {
+            forYouList.takeIf { it.isNotEmpty() }?.let {
                 add(Shelf.Lists.Items(id = "pl_for_you", title = "Created for you", list = it))
             }
-            collab.await().takeIf { it.isNotEmpty() }?.let {
+            collabList.takeIf { it.isNotEmpty() }?.let {
                 add(Shelf.Lists.Items(id = "pl_collab", title = "Collaborative playlists", list = it))
             }
         }
+    }
+
+    private suspend fun feedbackTracks(user: String, score: Int): List<Track> {
+        val items = lbGet(
+            lbUrl("1", "feedback", "user", user, "get-feedback",
+                params = mapOf("score" to score.toString(), "count" to "100", "metadata" to "true"))
+        )?.arr("feedback")?.mapNotNull { it as? JsonObject }.orEmpty()
+
+        val direct = items.map { it.listenToTrack() }
+        // voci senza metadati: le risolvo con una sola ricerca su MB
+        val missing = items.filterIndexed { i, _ -> direct[i] == null }
+            .mapNotNull { it["recording_mbid"].str() }.take(25)
+        val fallback = if (missing.isEmpty()) emptyMap()
+        else mb.recordingsByMbids(missing).associateBy { it.id }
+
+        lbLog("feedback score=$score: ${items.size} voci, ${missing.size} da MB")
+        return items.mapIndexedNotNull { i, o -> direct[i] ?: fallback[o["recording_mbid"].str()] }
+    }
+
+    private suspend fun tasteShelves(user: String): List<Shelf> = coroutineScope {
+        val loved = async { feedbackTracks(user, 1) }
+        val hated = async { feedbackTracks(user, -1) }
+        buildList {
+            loved.await().takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Tracks(id = "loved", title = "Loved tracks", list = it))
+            }
+            hated.await().takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Tracks(id = "hated", title = "Hated tracks", list = it))
+            }
+        }
+    }
+
+    private val coverGate = Semaphore(4)
+
+    private suspend fun withCovers(list: List<Playlist>): List<Playlist> = coroutineScope {
+        val head = list.take(20).map { p ->
+            async {
+                val tracks = coverGate.withPermit { playlistJson(p.id)?.arr("track") }
+                val cover: ImageHolder? = tracks?.firstNotNullOfOrNull { (it as? JsonObject)?.jspfTrack()?.cover }
+                p.copy(
+                    cover = cover ?: p.cover,
+                    background = cover ?: p.background,
+                    trackCount = tracks?.size?.toLong() ?: p.trackCount,
+                )
+            }
+        }.awaitAll()
+        head + list.drop(20)
     }
 
     // --- Playlist ---
@@ -431,13 +492,13 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
 
     private suspend fun playlistJson(id: String): JsonObject? {
         playlistCache[id]?.let { (t, o) ->
-            if (System.currentTimeMillis() - t < 60_000) return o
+            if (System.currentTimeMillis() - t < 600_000) return o
         }
         val o = lbGet(lbUrl("1", "playlist", id))?.obj("playlist") ?: run {
             lbLog("playlist $id")
             return null
         }
-        if (playlistCache.size > 20) playlistCache.clear()
+        if (playlistCache.size > 60) playlistCache.clear()
         playlistCache[id] = System.currentTimeMillis() to o
         return o
     }
@@ -445,7 +506,11 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     override suspend fun loadPlaylist(playlist: Playlist): Playlist {
         val pl = playlistJson(playlist.id) ?: return playlist
         val raw = pl.arr("track").mapNotNull { it as? JsonObject }
-        val cover = raw.firstNotNullOfOrNull { it.jspfTrack()?.cover }
+        var cover: ImageHolder? = raw.firstNotNullOfOrNull { it.jspfTrack()?.cover }
+        if (cover == null) {
+            val ids = raw.mapNotNull { it.jspfTrack()?.id }.take(3)
+            cover = mb.recordingsByMbids(ids).firstNotNullOfOrNull { it.cover }
+        }
         val duration = raw.sumOf { (it["duration"] as? JsonPrimitive)?.longOrNull ?: 0L }
         return playlist.copy(
             trackCount = raw.size.toLong(),

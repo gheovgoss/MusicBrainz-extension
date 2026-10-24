@@ -14,7 +14,9 @@ fun JsonObject.listenToTrack(): Track? {
     val title = tm["track_name"].str() ?: return null
     val artistName = tm["artist_name"].str().orEmpty()
 
-    val mbid = map?.get("recording_mbid").str() ?: info?.get("recording_mbid").str()
+    val mbid = map?.get("recording_mbid").str()
+        ?: info?.get("recording_mbid").str()
+        ?: this["recording_mbid"].str()
     val releaseMbid = map?.get("release_mbid").str() ?: info?.get("release_mbid").str()
     val rgMbid = info?.get("release_group_mbid").str()
 
@@ -155,7 +157,8 @@ fun JsonObject.jspfTrack(): Track? {
     val artistMbid = (ext?.get("artist_identifiers") as? JsonArray)?.firstOrNull().str()
         ?.substringAfterLast('/')
     val name = this["creator"].str() ?: "?"
-    val release = ext?.get("release_identifier").str()?.substringAfterLast('/')
+    val release = ext?.obj("additional_metadata")?.get("caa_release_mbid").str()
+        ?: ext?.get("release_identifier").str()?.substringAfterLast('/')
 
     return Track(
         id = mbid,
