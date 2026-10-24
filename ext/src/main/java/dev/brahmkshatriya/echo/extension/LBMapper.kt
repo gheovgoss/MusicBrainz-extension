@@ -2,6 +2,7 @@ package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
+import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.serialization.json.*
 
@@ -176,5 +177,35 @@ fun JsonObject.jspfTrack(): Track? {
         isSaveable = false,
         isHideable = false,
         isLikeable = false,
+    )
+}
+
+private const val JSPF_PL = "https://musicbrainz.org/doc/jspf#playlist"
+
+fun JsonObject.jspfPlaylist(): Playlist? {
+    val pl = obj("playlist") ?: this
+    val id = pl["identifier"].str()?.substringAfterLast('/')?.takeIf { it.length == 36 } ?: return null
+    val title = pl["title"].str() ?: return null
+    val ext = pl.obj("extension")?.obj(JSPF_PL)
+    val creator = pl["creator"].str()
+    val createdFor = ext?.get("created_for").str()
+    val isPublic = (ext?.get("public") as? JsonPrimitive)?.booleanOrNull ?: true
+
+    return Playlist(
+        id = id,
+        title = title,
+        isEditable = true,
+        isPrivate = !isPublic,
+        creationDate = pl["date"].str()?.take(10).toEchoDate(),
+        description = pl["annotation"].str()?.replace(Regex("<[^>]*>"), "")?.trim()?.ifEmpty { null },
+        subtitle = when {
+            createdFor != null -> "Created for you"
+            creator != null -> "by $creator"
+            else -> null
+        },
+        extras = mapOf("mbid" to id),
+        isRadioSupported = true,
+        isSaveable = false,
+        isShareable = false,
     )
 }

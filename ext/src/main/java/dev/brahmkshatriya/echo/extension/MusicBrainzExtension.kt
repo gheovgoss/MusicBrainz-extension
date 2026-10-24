@@ -4,7 +4,9 @@ import dev.brahmkshatriya.echo.common.clients.AlbumClient
 import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
+import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.PlaylistClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
@@ -25,6 +27,7 @@ import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
@@ -32,13 +35,15 @@ import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
 
 private fun lbLog(msg: String) = println("MbExt: $msg")
 
 class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
-    AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient {
+    AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient, LibraryFeedClient,
+    PlaylistClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -388,4 +393,74 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                 ?.obj("playlist")?.arr("track")
         }.getOrNull()?.mapNotNull { (it as? JsonObject)?.jspfTrack() }.orEmpty()
     }
+
+    // --- Library: playlist ---
+
+    override suspend fun loadLibraryFeed(): Feed<Shelf> =
+        PagedData.Single{ librarySections() }.toFeed()
+
+    private suspend fun librarySections(): List<Shelf> = coroutineScope {
+        val user = currentUser?.id ?: return@coroutineScope emptyList()
+
+        fun fetch(vararg tail: String) = async {
+            lbGet(lbUrl("1", "user", user, *tail, params = mapOf("count" to "50")))
+                ?.arr("playlists")
+                ?.mapNotNull { (it as? JsonObject)?.jspfPlaylist() }
+                .orEmpty()
+        }
+        val mine = fetch("playlists")
+        val forYou = fetch("playlists", "createdfor")
+        val collab = fetch("playlists", "collaborator")
+
+        buildList {
+            mine.await().takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Items(id = "pl_mine", title = "Playlists", list = it))
+            }
+            forYou.await().takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Items(id = "pl_for_you", title = "Created for you", list = it))
+            }
+            collab.await().takeIf { it.isNotEmpty() }?.let {
+                add(Shelf.Lists.Items(id = "pl_collab", title = "Collaborative playlists", list = it))
+            }
+        }
+    }
+
+    // --- Playlist ---
+
+    private val playlistCache = ConcurrentHashMap<String, Pair<Long, JsonObject>>()
+
+    private suspend fun playlistJson(id: String): JsonObject? {
+        playlistCache[id]?.let { (t, o) ->
+            if (System.currentTimeMillis() - t < 60_000) return o
+        }
+        val o = lbGet(lbUrl("1", "playlist", id))?.obj("playlist") ?: run {
+            lbLog("playlist $id")
+            return null
+        }
+        if (playlistCache.size > 20) playlistCache.clear()
+        playlistCache[id] = System.currentTimeMillis() to o
+        return o
+    }
+
+    override suspend fun loadPlaylist(playlist: Playlist): Playlist {
+        val pl = playlistJson(playlist.id) ?: return playlist
+        val raw = pl.arr("track").mapNotNull { it as? JsonObject }
+        val cover = raw.firstNotNullOfOrNull { it.jspfTrack()?.cover }
+        val duration = raw.sumOf { (it["duration"] as? JsonPrimitive)?.longOrNull ?: 0L }
+        return playlist.copy(
+            trackCount = raw.size.toLong(),
+            duration = duration.takeIf { it > 0 },
+            cover = cover ?: playlist.cover,
+            background = cover ?: playlist.background,
+        )
+    }
+
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> =
+        PagedData.Single {
+            playlistJson(playlist.id)?.arr("track")
+                ?.mapNotNull { (it as? JsonObject)?.jspfTrack() }
+                .orEmpty()
+        }.toFeed()
+
+    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
 }
