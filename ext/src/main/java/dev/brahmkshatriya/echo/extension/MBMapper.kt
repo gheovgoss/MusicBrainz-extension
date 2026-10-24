@@ -120,8 +120,8 @@ fun JsonObject.toTrack(): Track? {
         isrc = isrc,
         extras = mapOf("mbid" to id),
         isRadioSupported = true,
-        isSaveable = false,
-        isHideable = false,
+        isSaveable = true,
+        isHideable = true,
         isLikeable = true,
     )
 }

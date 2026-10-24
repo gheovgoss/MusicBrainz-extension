@@ -66,8 +66,8 @@ fun JsonObject.listenToTrack(): Track? {
         duration = (info?.get("duration_ms") as? JsonPrimitive)?.longOrNull,
         extras = if (mbid != null) mapOf("mbid" to mbid) else emptyMap(),
         isRadioSupported = true,
-        isSaveable = false,
-        isHideable = false,
+        isSaveable = true,
+        isHideable = true,
         isLikeable = true,
     )
 }
@@ -143,8 +143,8 @@ fun JsonObject.popularTrack(fallback: Artist): Track? {
         artists = artists,
         extras = mapOf("mbid" to id),
         isRadioSupported = true,
-        isSaveable = false,
-        isHideable = false,
+        isSaveable = true,
+        isHideable = true,
         isLikeable = true,
     )
 }

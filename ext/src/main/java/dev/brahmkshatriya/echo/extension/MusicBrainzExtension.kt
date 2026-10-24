@@ -3,6 +3,7 @@ package dev.brahmkshatriya.echo.extension
 import dev.brahmkshatriya.echo.common.clients.AlbumClient
 import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
+import dev.brahmkshatriya.echo.common.clients.HideClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
 import dev.brahmkshatriya.echo.common.clients.LikeClient
@@ -10,7 +11,6 @@ import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.clients.PlaylistClient
 import dev.brahmkshatriya.echo.common.clients.PlaylistEditPrivacyClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
-import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.*
 import kotlinx.coroutines.Dispatchers
@@ -51,7 +51,7 @@ private fun lbLog(msg: String) = println("MbExt: $msg")
 
 class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
     AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient, LibraryFeedClient,
-    PlaylistClient, PlaylistEditPrivacyClient, LikeClient {
+    PlaylistClient, PlaylistEditPrivacyClient, LikeClient, HideClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -138,38 +138,6 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         "EchoMusicBrainz/0.1 ( $contact )"
     })
 
-    private suspend fun lookupMbid(d: TrackDetails): String? {
-        d.track.extras["mbid"]?.takeIf { it.isNotBlank() }?.let { return it }
-
-        val names = d.track.artists.map { it.name }.filter { it.isNotBlank() }
-        val candidates = listOfNotNull(names.joinToString(", ").ifEmpty { null }, names.firstOrNull()).distinct()
-        if (candidates.isEmpty() || d.track.title.isBlank()) return null
-
-        for (artist in candidates) {
-            val url = (apiRoot() + "/1/metadata/lookup/").toHttpUrl().newBuilder()
-                .addQueryParameter("artist_name", artist)
-                .addQueryParameter("recording_name", d.track.title)
-                .build()
-            val body = try {
-                withContext(Dispatchers.IO) {
-                    http.newCall(Request.Builder().url(url).header("Authorization", "Token ${token.orEmpty()}").get().build()).execute().use {
-                        val b = if (it.isSuccessful) it.body.string() else null
-                        lbLog("lookup HTTP ${it.code} per '$artist' - '${d.track.title}': ${b?.take(300)}")
-                        b
-                    }
-                }
-            } catch (e: Exception) {
-                lbLog("lookup error: ${e.message}")
-                null
-            } ?: continue
-            val mbid = runCatching {
-                json.parseToJsonElement(body).jsonObject["recording_mbid"]?.jsonPrimitive?.contentOrNull
-            }.getOrNull()
-            if (!mbid.isNullOrBlank()) return mbid
-        }
-        return null
-    }
-
     // --- Search ---
 
     override suspend fun loadSearchFeed(query: String): Feed<Shelf> =
@@ -229,9 +197,8 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         if (token == null) lbLog("popular: no login, server can send 401")
         val root = lbGet(lbUrl("1", "popularity", "top-recordings-for-artist", mbid))
         lbLog("popular: keys=${root?.keys}")
-        return root?.arr("items")
-            ?.mapNotNull { (it as? JsonObject)?.popularTrack(artist) }
-            ?.take(limit).orEmpty()
+        val all = root?.arr("items")?.mapNotNull { (it as? JsonObject)?.popularTrack(artist) }.orEmpty()
+        return all.withoutHated().take(limit)
     }
 
     // --- Track ---
@@ -246,16 +213,22 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
 
-    // --- Like ---
+    // --- Like / Hide---
 
-    private val lovedMutex = Mutex()
-    private val loved = mutableSetOf<String>()
-    private var lovedFor: String? = null
-    private var lovedAt = 0L
+    private val fbMutex = Mutex()
+    private val fbSets: Map<Int, MutableSet<String>> = mapOf(1 to mutableSetOf(), -1 to mutableSetOf())
+    private val fbAt = mutableMapOf(1 to 0L, -1 to 0L)
+    private var fbFor: String? = null
 
-    private suspend fun lovedSet(force: Boolean = false): Set<String> = lovedMutex.withLock {
+    private suspend fun feedbackSet(score: Int, force: Boolean = false): Set<String> = fbMutex.withLock {
         val user = currentUser?.id ?: return@withLock emptySet()
-        val fresh = !force && lovedFor == user && System.currentTimeMillis() - lovedAt < 300_000
+        if (fbFor != user) {
+            fbSets.values.forEach { it.clear() }
+            fbAt[1] = 0L; fbAt[-1] = 0L
+            fbFor = user
+        }
+        val set = fbSets.getValue(score)
+        val fresh = !force && System.currentTimeMillis() - (fbAt[score] ?: 0L) < 300_000
         if (!fresh) {
             val all = mutableSetOf<String>()
             var offset = 0
@@ -263,37 +236,61 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
             while (offset < 2000) {
                 val page = lbGet(
                     lbUrl("1", "feedback", "user", user, "get-feedback",
-                        params = mapOf("score" to "1", "count" to "100", "offset" to offset.toString()))
-                ) ?: run { ok = offset > 0; null } ?: break
+                        params = mapOf("score" to score.toString(), "count" to "100", "offset" to offset.toString()))
+                )
+                if (page == null) { ok = false; break }
                 val items = page.arr("feedback")
                 items.forEach { (it as? JsonObject)?.get("recording_mbid").str()?.let(all::add) }
                 val total = (page["total_count"] as? JsonPrimitive)?.longOrNull ?: 0L
                 offset += 100
                 if (items.isEmpty() || offset >= total) break
             }
-            if (ok) {
-                loved.clear(); loved.addAll(all)
-                lovedFor = user; lovedAt = System.currentTimeMillis()
-            }
+            if (ok) { set.clear(); set.addAll(all); fbAt[score] = System.currentTimeMillis() }
         }
-        loved.toSet()
+        set.toSet()
+    }
+
+    private suspend fun setLocal(mbid: String, score: Int) = fbMutex.withLock {
+        fbSets.values.forEach { it.remove(mbid) }
+        if (score != 0) fbSets[score]?.add(mbid)
+    }
+
+    private suspend fun sendFeedback(mbid: String, score: Int) {
+        lbPost(
+            lbUrl("1", "feedback", "recording-feedback"),
+            buildJsonObject { put("recording_mbid", mbid); put("score", score) }
+        )
+        setLocal(mbid, score)
     }
 
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean {
         val mbid = (item as? Track)?.let { quickMbid(it) } ?: return false
-        return mbid in lovedSet()
+        return mbid in feedbackSet(1)
     }
 
     override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) {
         val track = item as? Track ?: error("Only tracks can be loved on ListenBrainz")
         val mbid = resolveMbid(track) ?: error("No MusicBrainz recording found for this track")
-        if (!shouldLike && mbid !in lovedSet(force = true)) return
+        if (!shouldLike && mbid !in feedbackSet(1, force = true)) return
+        sendFeedback(mbid, if (shouldLike) 1 else 0)
+    }
 
-        lbPost(
-            lbUrl("1", "feedback", "recording-feedback"),
-            buildJsonObject { put("recording_mbid", mbid); put("score", if (shouldLike) 1 else 0) }
-        )
-        lovedMutex.withLock { if (shouldLike) loved.add(mbid) else loved.remove(mbid) }
+    override suspend fun isItemHidden(item: EchoMediaItem): Boolean {
+        val mbid = (item as? Track)?.let { quickMbid(it) } ?: return false
+        return mbid in feedbackSet(-1)
+    }
+
+    override suspend fun hideItem(item: EchoMediaItem, shouldHide: Boolean) {
+        val track = item as? Track ?: error("Only tracks can be hidden on ListenBrainz")
+        val mbid = resolveMbid(track) ?: error("No MusicBrainz recording found for this track")
+        if (!shouldHide && mbid !in feedbackSet(-1, force = true)) return
+        sendFeedback(mbid, if (shouldHide) -1 else 0)
+    }
+
+    private suspend fun List<Track>.withoutHated(): List<Track> {
+        val hated = feedbackSet(-1)
+        if (hated.isEmpty()) return this
+        return filter { quickMbid(it) !in hated }
     }
 
     // --- Home ---
@@ -339,7 +336,7 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                 params = mapOf("count" to "20")))
                 ?.obj("payload")?.arr("mbids")
                 ?.mapNotNull { (it as? JsonObject)?.get("recording_mbid").str() }.orEmpty()
-            mb.recordingsByMbids(mbids)
+            mb.recordingsByMbids(mbids).withoutHated()
         }
 
         fun tracks(id: String, l: List<Track>) {
@@ -429,7 +426,7 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         val mbid = radio.extras["mbid"]
         val name = radio.extras["name"]
         for (key in listOfNotNull(mbid, name).distinct()) {
-            val t = lbRadio("artist:($key)")
+            val t = lbRadio("artist:($key)").withoutHated()
             if (t.isNotEmpty()) return t
         }
         if (mbid != null && usePopularTracks()) {
@@ -609,9 +606,9 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         }
     }
 
-    private val UUID_RE = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    private val uuidre = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-    private fun quickMbid(t: Track): String? = t.extras["mbid"]?.takeIf { UUID_RE.matches(it) }
+    private fun quickMbid(t: Track): String? = t.extras["mbid"]?.takeIf { uuidre.matches(it) }
 
     private suspend fun resolveMbid(t: Track): String? {
         quickMbid(t)?.let { return it }
