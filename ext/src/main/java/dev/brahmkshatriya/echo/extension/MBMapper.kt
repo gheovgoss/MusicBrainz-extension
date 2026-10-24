@@ -122,7 +122,7 @@ fun JsonObject.toTrack(): Track? {
         isRadioSupported = true,
         isSaveable = false,
         isHideable = false,
-        isLikeable = false,
+        isLikeable = true,
     )
 }
 

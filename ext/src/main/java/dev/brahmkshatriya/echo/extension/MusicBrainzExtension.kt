@@ -5,15 +5,15 @@ import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LibraryFeedClient
+import dev.brahmkshatriya.echo.common.clients.LikeClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.clients.PlaylistClient
+import dev.brahmkshatriya.echo.common.clients.PlaylistEditPrivacyClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.*
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.OkHttpClient
@@ -36,9 +36,13 @@ import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
@@ -47,7 +51,7 @@ private fun lbLog(msg: String) = println("MbExt: $msg")
 
 class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
     AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient, LibraryFeedClient,
-    PlaylistClient {
+    PlaylistClient, PlaylistEditPrivacyClient, LikeClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -56,12 +60,13 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         const val STATS_RANGE = "month"
         const val KEY_MOCK = "mock_home"
 
+        const val USE_POPULAR = "use_popular"
+
     }
 
     private lateinit var settings: Settings
     private val http = OkHttpClient()
     private val json = Json { ignoreUnknownKeys = true }
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var currentUser: User? = null
     private var token: String? = null
@@ -74,6 +79,10 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         SettingTextInput("Contact (email or URL)", KEY_CONTACT, "Sent to MusicBrainz in the User-Agent, as they require", ""),
 
         SettingSwitch(
+            "Use Popular Tracks", USE_POPULAR,
+            "Use popular tracks if the radio fails to fetch similar songs", true
+        ),
+        SettingSwitch(
             "Mock data", KEY_MOCK,
             "Developer setting for MusicBrainz, leave this to false", false
         ),
@@ -84,6 +93,8 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     private fun apiRoot() = settings.getString(KEY_API_URL)?.trim()?.trimEnd('/')?.ifEmpty { null } ?: DEFAULT_API_URL
 
     private fun mockEnabled() = settings.getBoolean(KEY_MOCK) ?: false
+
+    private fun usePopularTracks() = true
 
 
     // --- Login---
@@ -210,7 +221,7 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
             addAll(discography)
         }
     }
-    private suspend fun popularTracks(artist: Artist): List<Track> {
+    private suspend fun popularTracks(artist: Artist, limit: Int = 30): List<Track> {
         val mbid = artist.extras["mbid"] ?: run {
             lbLog("popular: artista senza mbid (${artist.id})")
             return emptyList()
@@ -220,7 +231,7 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         lbLog("popular: keys=${root?.keys}")
         return root?.arr("items")
             ?.mapNotNull { (it as? JsonObject)?.popularTrack(artist) }
-            ?.take(10).orEmpty()
+            ?.take(limit).orEmpty()
     }
 
     // --- Track ---
@@ -234,6 +245,56 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     ): Streamable.Media = error("No stream audio from MB")
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+
+    // --- Like ---
+
+    private val lovedMutex = Mutex()
+    private val loved = mutableSetOf<String>()
+    private var lovedFor: String? = null
+    private var lovedAt = 0L
+
+    private suspend fun lovedSet(force: Boolean = false): Set<String> = lovedMutex.withLock {
+        val user = currentUser?.id ?: return@withLock emptySet()
+        val fresh = !force && lovedFor == user && System.currentTimeMillis() - lovedAt < 300_000
+        if (!fresh) {
+            val all = mutableSetOf<String>()
+            var offset = 0
+            var ok = true
+            while (offset < 2000) {
+                val page = lbGet(
+                    lbUrl("1", "feedback", "user", user, "get-feedback",
+                        params = mapOf("score" to "1", "count" to "100", "offset" to offset.toString()))
+                ) ?: run { ok = offset > 0; null } ?: break
+                val items = page.arr("feedback")
+                items.forEach { (it as? JsonObject)?.get("recording_mbid").str()?.let(all::add) }
+                val total = (page["total_count"] as? JsonPrimitive)?.longOrNull ?: 0L
+                offset += 100
+                if (items.isEmpty() || offset >= total) break
+            }
+            if (ok) {
+                loved.clear(); loved.addAll(all)
+                lovedFor = user; lovedAt = System.currentTimeMillis()
+            }
+        }
+        loved.toSet()
+    }
+
+    override suspend fun isItemLiked(item: EchoMediaItem): Boolean {
+        val mbid = (item as? Track)?.let { quickMbid(it) } ?: return false
+        return mbid in lovedSet()
+    }
+
+    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) {
+        val track = item as? Track ?: error("Only tracks can be loved on ListenBrainz")
+        val mbid = resolveMbid(track) ?: error("No MusicBrainz recording found for this track")
+        if (!shouldLike && mbid !in lovedSet(force = true)) return
+
+        lbPost(
+            lbUrl("1", "feedback", "recording-feedback"),
+            buildJsonObject { put("recording_mbid", mbid); put("score", if (shouldLike) 1 else 0) }
+        )
+        lovedMutex.withLock { if (shouldLike) loved.add(mbid) else loved.remove(mbid) }
+    }
 
     // --- Home ---
 
@@ -371,6 +432,10 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
             val t = lbRadio("artist:($key)")
             if (t.isNotEmpty()) return t
         }
+        if (mbid != null && usePopularTracks()) {
+            val seed = Artist(id = mbid, name = name ?: "?", extras = mapOf("mbid" to mbid))
+            return popularTracks(seed).shuffled()
+        }
         return emptyList()
     }
 
@@ -382,8 +447,9 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                     token?.let { header("Authorization", "Token $it") }
                 }.get().build()
                 slowHttp.newCall(req).execute().use {
-                    lbLog("lb-radio HTTP ${it.code} per $prompt")
-                    if (it.isSuccessful) it.body.string() else null
+                    val text = it.body.string()
+                    lbLog("lb-radio HTTP ${it.code} - $prompt" + if (it.isSuccessful) "" else ": ${text.take(200)}")
+                    if (it.isSuccessful) text else null
                 }
             }
         } catch (e: CancellationException) {
@@ -406,15 +472,10 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     private suspend fun librarySections(): List<Shelf> = coroutineScope {
         val user = currentUser?.id ?: return@coroutineScope emptyList()
 
-        fun fetch(vararg tail: String) = async {
-            lbGet(lbUrl("1", "user", user, *tail, params = mapOf("count" to "50")))
-                ?.arr("playlists")
-                ?.mapNotNull { (it as? JsonObject)?.jspfPlaylist() }
-                .orEmpty()
-        }
-        val mine = fetch("playlists")
-        val forYou = fetch("playlists", "createdfor")
-        val collab = fetch("playlists", "collaborator")
+        fun fetch(editable: Boolean, vararg tail: String) = async { userPlaylists(user, editable, *tail) }
+        val mine = fetch(true, "playlists")
+        val forYou = fetch(false, "playlists", "createdfor")
+        val collab = fetch(true, "playlists", "collaborator")
 
         val mineList = withCovers(mine.await())
         val forYouList = withCovers(forYou.await())
@@ -446,7 +507,6 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         )?.arr("feedback")?.mapNotNull { it as? JsonObject }.orEmpty()
 
         val direct = items.map { it.listenToTrack() }
-        // voci senza metadati: le risolvo con una sola ricerca su MB
         val missing = items.filterIndexed { i, _ -> direct[i] == null }
             .mapNotNull { it["recording_mbid"].str() }.take(25)
         val fallback = if (missing.isEmpty()) emptyMap()
@@ -490,12 +550,12 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
 
     private val playlistCache = ConcurrentHashMap<String, Pair<Long, JsonObject>>()
 
-    private suspend fun playlistJson(id: String): JsonObject? {
-        playlistCache[id]?.let { (t, o) ->
+    private suspend fun playlistJson(id: String, fresh: Boolean = false): JsonObject? {
+        if (!fresh) playlistCache[id]?.let { (t, o) ->
             if (System.currentTimeMillis() - t < 600_000) return o
         }
         val o = lbGet(lbUrl("1", "playlist", id))?.obj("playlist") ?: run {
-            lbLog("playlist $id")
+            lbLog("playlist $id not loaded")
             return null
         }
         if (playlistCache.size > 60) playlistCache.clear()
@@ -512,7 +572,11 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
             cover = mb.recordingsByMbids(ids).firstNotNullOfOrNull { it.cover }
         }
         val duration = raw.sumOf { (it["duration"] as? JsonPrimitive)?.longOrNull ?: 0L }
+        val ext = pl.obj("extension")?.obj(JSPF_PL)
         return playlist.copy(
+            title = pl["title"].str() ?: playlist.title,
+            description = pl["annotation"].str()?.replace(Regex("<[^>]*>"), "")?.trim()?.ifEmpty { null },
+            isPrivate = !((ext?.get("public") as? JsonPrimitive)?.booleanOrNull ?: false),
             trackCount = raw.size.toLong(),
             duration = duration.takeIf { it > 0 },
             cover = cover ?: playlist.cover,
@@ -528,4 +592,188 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         }.toFeed()
 
     override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = null
+
+    private suspend fun lbPost(url: HttpUrl, body: JsonObject?): JsonObject? {
+        val tk = token ?: error("Log in to ListenBrainz first")
+        val req = Request.Builder().url(url)
+            .header("Authorization", "Token $tk")
+            .post((body?.toString() ?: "{}").toRequestBody("application/json".toMediaType()))
+            .build()
+        return withContext(Dispatchers.IO) {
+            http.newCall(req).execute().use { r ->
+                val text = r.body.string()
+                lbLog("POST ${url.encodedPath} body=${body?.toString()?.take(300)} -> HTTP ${r.code} ${text.take(200)}")
+                check(r.isSuccessful) { "ListenBrainz HTTP ${r.code}: ${text.take(200)}" }
+                runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
+            }
+        }
+    }
+
+    private val UUID_RE = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+    private fun quickMbid(t: Track): String? = t.extras["mbid"]?.takeIf { UUID_RE.matches(it) }
+
+    private suspend fun resolveMbid(t: Track): String? {
+        quickMbid(t)?.let { return it }
+        t.isrc?.takeIf { it.isNotBlank() }?.let { isrc ->
+            (mb.get("isrc/$isrc")?.arr("recordings")?.firstOrNull() as? JsonObject)
+                ?.get("id").str()?.let { return it }
+        }
+        val artist = t.artists.joinToString(", ") { it.name }.trim()
+        if (artist.isEmpty() || t.title.isBlank()) return null
+        return lbGet(
+            lbUrl("1", "metadata", "lookup", "",
+                params = mapOf("artist_name" to artist, "recording_name" to t.title))
+        )?.get("recording_mbid").str()
+    }
+
+    private data class PlMeta(
+        val title: String, val annotation: String, val public: Boolean, val collaborators: List<String>,
+    )
+
+    private suspend fun currentMeta(id: String): PlMeta {
+        val pl = playlistJson(id, fresh = true) ?: error("Playlist not found")
+        val ext = pl.obj("extension")?.obj(JSPF_PL)
+        return PlMeta(
+            title = pl["title"].str().orEmpty(),
+            annotation = pl["annotation"].str().orEmpty(),
+            public = (ext?.get("public") as? JsonPrimitive)?.booleanOrNull ?: false,
+            collaborators = ext?.arr("collaborators")?.mapNotNull { it.str() }.orEmpty(),
+        )
+    }
+
+    private suspend fun updatePlaylist(id: String, change: (PlMeta) -> PlMeta) {
+        val m = change(currentMeta(id))
+        lbLog("CALL edit id=$id title='${m.title}' annotation='${m.annotation}' public=${m.public}")
+        val body = buildJsonObject {
+            putJsonObject("playlist") {
+                put("title", m.title)
+                put("annotation", m.annotation)
+                putJsonObject("extension") {
+                    putJsonObject(JSPF_PL) {
+                        put("public", m.public)
+                        put("collaborators", JsonArray(m.collaborators.map { JsonPrimitive(it) }))
+                    }
+                }
+            }
+        }
+        lbPost(lbUrl("1", "playlist", "edit", id), body)
+        playlistCache.remove(id)
+    }
+
+    private fun recordingsBody(mbids: List<String>) = buildJsonObject {
+        putJsonObject("playlist") {
+            put("track", JsonArray(mbids.map {
+                buildJsonObject { put("identifier", "https://musicbrainz.org/recording/$it") }
+            }))
+        }
+    }
+
+    private fun JsonObject.hasRecording(mbid: String): Boolean = arr("track").any { t ->
+        val o = t as? JsonObject ?: return@any false
+        val ident = (o["identifier"] as? JsonArray)?.firstOrNull().str() ?: o["identifier"].str()
+        ident?.endsWith(mbid) == true
+    }
+
+    private suspend fun userPlaylists(user: String, editable: Boolean, vararg tail: String): List<Playlist> =
+        lbGet(lbUrl("1", "user", user, *tail, params = mapOf("count" to "50")))
+            ?.arr("playlists")?.mapNotNull { (it as? JsonObject)?.jspfPlaylist(editable) }.orEmpty()
+
+    override suspend fun createPlaylist(title: String, description: String?): Playlist {
+        val res = lbPost(
+            lbUrl("1", "playlist", "create"),
+            buildJsonObject {
+                putJsonObject("playlist") {
+                    put("title", title)
+                    putJsonObject("extension") {
+                        putJsonObject(JSPF_PL) { put("public", false) }
+                    }
+                }
+            }
+        )
+        val id = res?.get("playlist_mbid").str() ?: error("ListenBrainz did not return the playlist id")
+        runCatching {
+            updatePlaylist(id) { it.copy(title = title, annotation = description.orEmpty(), public = false) }
+        }.onFailure { lbLog("create: modifica successiva fallita: ${it.message}") }
+        return Playlist(
+            id = id, title = title, isEditable = true, isPrivate = true, description = description,
+            extras = mapOf("mbid" to id),
+            isRadioSupported = false, isSaveable = false, isShareable = false,
+        )
+    }
+
+    override suspend fun editPlaylistMetadata(playlist: Playlist, title: String, description: String?) =
+        updatePlaylist(playlist.id) { it.copy(title = title, annotation = description.orEmpty()) }
+
+    override suspend fun setPrivacy(playlist: Playlist, isPrivate: Boolean) =
+        updatePlaylist(playlist.id) { lbLog("CALL privacy id=${playlist.id} private=$isPrivate"); it.copy(public = !isPrivate) }
+
+    override suspend fun deletePlaylist(playlist: Playlist) {
+        lbPost(lbUrl("1", "playlist", playlist.id, "delete"), null)
+        playlistCache.remove(playlist.id)
+    }
+
+    override suspend fun addTracksToPlaylist(
+        playlist: Playlist, tracks: List<Track>, index: Int, new: List<Track>,
+    ) {
+        val mbids = new.mapNotNull { resolveMbid(it) }
+        check(mbids.isNotEmpty()) { "No MusicBrainz recording found for the selected tracks" }
+        if (mbids.size < new.size) lbLog("add: ${new.size - mbids.size} tracce senza MBID saltate")
+
+        var offset = index
+        for (chunk in mbids.chunked(50)) {
+            val url = if (index in 0 until tracks.size)
+                lbUrl("1", "playlist", playlist.id, "item", "add", offset.toString())
+            else lbUrl("1", "playlist", playlist.id, "item", "add")
+            lbPost(url, recordingsBody(chunk))
+            offset += chunk.size
+        }
+        playlistCache.remove(playlist.id)
+    }
+
+    override suspend fun moveTrackInPlaylist(
+        playlist: Playlist, tracks: List<Track>, fromIndex: Int, toIndex: Int,
+    ) {
+        val mbid = tracks.getOrNull(fromIndex)?.let { quickMbid(it) }
+            ?: error("Cannot move: track without a MusicBrainz id")
+        lbPost(
+            lbUrl("1", "playlist", playlist.id, "item", "move"),
+            buildJsonObject { put("mbid", mbid); put("from", fromIndex); put("to", toIndex); put("count", 1) }
+        )
+        playlistCache.remove(playlist.id)
+    }
+
+    override suspend fun removeTracksFromPlaylist(
+        playlist: Playlist, tracks: List<Track>, indexes: List<Int>,
+    ) {
+        val runs = mutableListOf<IntRange>()
+        lbLog("CALL remove id=${playlist.id} indexes=$indexes tracks=${tracks.size}")
+        for (i in indexes.distinct().sorted()) {
+            val last = runs.lastOrNull()
+            if (last != null && i == last.last + 1) runs[runs.lastIndex] = last.first..i else runs.add(i..i)
+        }
+        for (r in runs.asReversed()) {
+            lbPost(
+                lbUrl("1", "playlist", playlist.id, "item", "delete"),
+                buildJsonObject { put("index", r.first); put("count", r.last - r.first + 1) }
+            )
+        }
+        playlistCache.remove(playlist.id)
+    }
+
+    override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> = coroutineScope {
+        val user = currentUser?.id ?: return@coroutineScope emptyList()
+        val own = async { userPlaylists(user, true, "playlists") }
+        val collab = async { userPlaylists(user, true, "playlists", "collaborator") }
+        val all = (own.await() + collab.await()).distinctBy { it.id }
+
+        val mbid = track?.let { quickMbid(it) }
+        all.map { p ->
+            async {
+                val has = mbid != null &&
+                        coverGate.withPermit { playlistJson(p.id) }?.hasRecording(mbid) == true
+                p to has
+            }
+        }.awaitAll()
+    }
 }

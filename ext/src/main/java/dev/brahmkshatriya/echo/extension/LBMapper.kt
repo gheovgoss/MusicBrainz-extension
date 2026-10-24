@@ -68,7 +68,7 @@ fun JsonObject.listenToTrack(): Track? {
         isRadioSupported = true,
         isSaveable = false,
         isHideable = false,
-        isLikeable = false,
+        isLikeable = true,
     )
 }
 
@@ -145,7 +145,7 @@ fun JsonObject.popularTrack(fallback: Artist): Track? {
         isRadioSupported = true,
         isSaveable = false,
         isHideable = false,
-        isLikeable = false,
+        isLikeable = true,
     )
 }
 
@@ -170,22 +170,22 @@ fun JsonObject.jspfTrack(): Track? {
                 name = name,
                 extras = artistMbid?.let { mapOf("mbid" to it) } ?: emptyMap(),
                 isRadioSupported = artistMbid != null,
-                isFollowable = false,
-                isSaveable = false,
+                isFollowable = true,
+                isSaveable = true,
             )
         ),
         duration = (this["duration"] as? JsonPrimitive)?.longOrNull,
         extras = mapOf("mbid" to mbid),
         isRadioSupported = true,
-        isSaveable = false,
-        isHideable = false,
-        isLikeable = false,
+        isSaveable = true,
+        isHideable = true,
+        isLikeable = true,
     )
 }
 
-private const val JSPF_PL = "https://musicbrainz.org/doc/jspf#playlist"
+const val JSPF_PL = "https://musicbrainz.org/doc/jspf#playlist"
 
-fun JsonObject.jspfPlaylist(): Playlist? {
+fun JsonObject.jspfPlaylist(editable: Boolean): Playlist? {
     val pl = obj("playlist") ?: this
     val id = pl["identifier"].str()?.substringAfterLast('/')?.takeIf { it.length == 36 } ?: return null
     val title = pl["title"].str() ?: return null
@@ -208,7 +208,7 @@ fun JsonObject.jspfPlaylist(): Playlist? {
         },
         extras = mapOf("mbid" to id),
         isRadioSupported = true,
-        isSaveable = false,
-        isShareable = false,
+        isSaveable = true,
+        isShareable = true,
     )
 }
