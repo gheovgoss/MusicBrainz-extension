@@ -1,20 +1,19 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.models.Artist
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.*
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-private fun mbLog(msg: String) = println("MbExt: $msg")
+fun mbLog(msg: String) = println("MbExt: $msg")
 
 class MBClient(
     private val http: OkHttpClient = OkHttpClient(),
@@ -32,6 +31,8 @@ class MBClient(
     private val mutex = Mutex()
     private var lastCallAt = 0L
     private val json = Json { ignoreUnknownKeys = true }
+
+    fun currentUserAgent() = userAgent()
 
     private val cache = object : LinkedHashMap<String, JsonObject>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, JsonObject>) = size > CACHE_SIZE
@@ -58,7 +59,7 @@ class MBClient(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    mbLog("errore di rete: ${e.message}")
+                    mbLog("error: ${e.message}")
                     null
                 }
                 lastCallAt = System.currentTimeMillis()
@@ -94,22 +95,31 @@ class MBClient(
 
     suspend fun getExternal(url: String): JsonObject? {
         synchronized(cache) { cache[url] }?.let { return it }
-        val text = try {
+        val resp = try {
             withContext(Dispatchers.IO) {
                 val req = Request.Builder().url(url)
                     .header("User-Agent", userAgent())
                     .header("Accept", "application/json")
                     .get().build()
-                http.newCall(req).execute().use { r -> if (r.isSuccessful) r.body.string() else null }
+                http.newCall(req).execute().use { r -> Resp(r.code, if (r.isSuccessful) r.body.string() else null) }
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            mbLog("errore esterno: ${e.message}")
-            null
-        } ?: return null
-        val obj = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull() ?: return null
+            mbLog("error: ${e.message} ($url)")
+            return null
+        }
+        val text = resp.body ?: run { mbLog("HTTP ${resp.code} : $url"); return null }
+        val el = runCatching { json.parseToJsonElement(text) }
+            .getOrElse { mbLog("JSON: $url"); return null }
+        val obj = el as? JsonObject ?: JsonObject(mapOf("items" to el))
         synchronized(cache) { cache[url] = obj }
         return obj
+    }
+
+    suspend fun artistLinks(artist: Artist): List<Pair<String, String>> {
+        val mbid = artist.extras["mbid"] ?: return emptyList()
+        val a = get("artist/$mbid", mapOf("inc" to "genres+url-rels")) ?: return emptyList()
+        return externalLinks(a.arr("relations").mapNotNull { it as? JsonObject })
     }
 }

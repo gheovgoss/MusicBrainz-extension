@@ -1,21 +1,9 @@
 package dev.brahmkshatriya.echo.extension
 
-import dev.brahmkshatriya.echo.common.models.Album
-import dev.brahmkshatriya.echo.common.models.Artist
-import dev.brahmkshatriya.echo.common.models.Date
-import dev.brahmkshatriya.echo.common.models.ImageHolder
-import dev.brahmkshatriya.echo.common.models.NetworkRequest
-import dev.brahmkshatriya.echo.common.models.Shelf
-import dev.brahmkshatriya.echo.common.models.Track
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.longOrNull
-import java.net.URLEncoder
+import dev.brahmkshatriya.echo.common.models.*
+import kotlinx.serialization.json.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import java.net.URLDecoder
 
 fun String?.toEchoDate(): Date? {
     val p = this?.split('-') ?: return null
@@ -108,8 +96,9 @@ suspend fun MBClient.albumTracks(album: Album): List<Track> = albumData(album)?.
 // Artists
 
 suspend fun MBClient.loadArtistDetails(artist: Artist): Artist {
-    if (artist.extras["mbid"] == null) return artist
-    val a = get("artist/${artist.id}", mapOf("inc" to "genres+url-rels")) ?: return artist
+    val mbid = artist.extras["mbid"] ?: return artist
+    val a = get("artist/$mbid", mapOf("inc" to "genres+url-rels")) ?: return artist
+    val rels = a.arr("relations").mapNotNull { it as? JsonObject }
 
     val span = a.obj("life-span")
     val begin = span?.get("begin").str()?.take(4)
@@ -121,21 +110,23 @@ suspend fun MBClient.loadArtistDetails(artist: Artist): Artist {
         .mapNotNull { it["name"].str() }
         .take(6)
 
-    val bio = listOfNotNull(
+    val subtitle = listOfNotNull(a["type"].str(), a["country"].str())
+        .joinToString(" • ").ifEmpty { null }
+
+    val qid = rels.firstOrNull { it["type"].str() == "wikidata" }
+        ?.obj("url")?.get("resource").str()?.substringAfterLast('/')
+    val entity = qid?.let { wikidataEntity(it) }
+    val img = artistImage(rels, entity)
+    val extract = entity?.let { wikipediaExtract(it) }
+
+    val facts = listOfNotNull(
         a["disambiguation"].str()?.takeIf { it.isNotBlank() },
         begin?.let { "Active: $it–${if (ended) end ?: "?" else "present"}" },
         area?.let { "Area: $it" },
         genres.takeIf { it.isNotEmpty() }?.let { "Genres: ${it.joinToString(", ")}" },
-    ).joinToString("\n").ifEmpty { null }
+    ).joinToString("\n")
 
-    val subtitle = listOfNotNull(a["type"].str(), a["country"].str())
-        .joinToString(" • ").ifEmpty { null }
-
-    val qid = a.arr("relations").mapNotNull { it as? JsonObject }
-        .firstOrNull { it["type"].str() == "wikidata" }
-        ?.obj("url")?.get("resource").str()
-        ?.substringAfterLast('/')
-    val img = qid?.let { wikidataImage(it) }
+    val bio = (if (extract != null) "$extract\n\nSource: Wikipedia" else facts).ifEmpty { null }
 
     return artist.copy(
         subtitle = subtitle ?: artist.subtitle,
@@ -193,16 +184,86 @@ suspend fun MBClient.loadTrackDetails(track: Track): Track {
     )
 }
 
-private suspend fun MBClient.wikidataImage(qid: String): ImageHolder? {
-    val e = getExternal("https://www.wikidata.org/wiki/Special:EntityData/$qid.json") ?: return null
-    val file = e.obj("entities")?.obj(qid)?.obj("claims")?.arr("P18")
-        ?.firstOrNull()?.let { it as? JsonObject }
-        ?.obj("mainsnak")?.obj("datavalue")?.get("value").str() ?: return null
-    val encoded = withContext(Dispatchers.IO) {
-        URLEncoder.encode(file, "UTF-8")
-    }.replace("+", "%20")
-    return ImageHolder.NetworkRequestImageHolder(
-        NetworkRequest(url = "https://commons.wikimedia.org/wiki/Special:FilePath/$encoded?width=600"),
-        false
-    )
+private val WIKI_LANGS = listOf("en")
+
+private suspend fun MBClient.wikidataEntity(qid: String): JsonObject? =
+    getExternal("https://www.wikidata.org/wiki/Special:EntityData/$qid.json")
+        ?.obj("entities")?.values?.firstOrNull() as? JsonObject
+
+private fun JsonObject.p18(): String? =
+    obj("claims")?.arr("P18")?.firstOrNull()?.let { it as? JsonObject }
+        ?.obj("mainsnak")?.obj("datavalue")?.get("value").str()
+
+private suspend fun MBClient.artistImage(rels: List<JsonObject>, entity: JsonObject?): ImageHolder? {
+    val fromRel = rels.firstOrNull { it["type"].str() == "image" }
+        ?.obj("url")?.get("resource").str()
+        ?.substringAfter("File:", "")?.takeIf { it.isNotBlank() }
+        ?.let { URLDecoder.decode(it, "UTF-8") }
+    val file = fromRel ?: entity?.p18()
+    return file?.let { commonsThumb(it) }
 }
+
+private suspend fun MBClient.wikipediaExtract(entity: JsonObject): String? {
+    val sitelinks = entity.obj("sitelinks") ?: return null
+    for (lang in WIKI_LANGS) {
+        val title = sitelinks.obj("${lang}wiki")?.get("title").str() ?: continue
+        val url = "https://$lang.wikipedia.org/w/api.php".toHttpUrl().newBuilder()
+            .addQueryParameter("action", "query")
+            .addQueryParameter("prop", "extracts")
+            .addQueryParameter("exintro", "1")
+            .addQueryParameter("explaintext", "1")
+            .addQueryParameter("redirects", "1")
+            .addQueryParameter("format", "json")
+            .addQueryParameter("titles", title)
+            .build().toString()
+        val page = getExternal(url)?.obj("query")?.obj("pages")?.values?.firstOrNull() as? JsonObject
+        val text = page?.get("extract").str()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+        mbLog("desc: $lang.wikipedia \"$title\" (${text.length} car.)")
+        return text
+    }
+    return null
+}
+private suspend fun MBClient.commonsThumb(file: String): ImageHolder? {
+    val api = "https://commons.wikimedia.org/w/api.php".toHttpUrl().newBuilder()
+        .addQueryParameter("action", "query")
+        .addQueryParameter("titles", "File:$file")
+        .addQueryParameter("prop", "imageinfo")
+        .addQueryParameter("iiprop", "url")
+        .addQueryParameter("iiurlwidth", "800")
+        .addQueryParameter("format", "json")
+        .build().toString()
+    val page = getExternal(api)?.obj("query")?.obj("pages")?.values?.firstOrNull() as? JsonObject
+    val info = page?.arr("imageinfo")?.firstOrNull() as? JsonObject
+    val url = info?.get("thumburl").str() ?: info?.get("url").str()
+    mbLog("immagine artista: file=$file url=$url")
+    return url?.let {
+        ImageHolder.NetworkRequestImageHolder(
+            NetworkRequest(url = it, headers = mapOf("User-Agent" to currentUserAgent())),
+            false
+        )
+    }
+}
+
+//EXTERNAL LINKS
+
+private val LINK_LABELS = linkedMapOf(
+    "spotify.com" to "Spotify", "deezer.com" to "Deezer",
+    "music.youtube.com" to "YouTube Music", "youtube.com" to "YouTube",
+    "music.apple.com" to "Apple Music", "itunes.apple.com" to "Apple Music",
+    "tidal.com" to "Tidal", "bandcamp.com" to "Bandcamp", "soundcloud.com" to "SoundCloud",
+    "instagram.com" to "Instagram", "facebook.com" to "Facebook",
+    "twitter.com" to "X", "x.com" to "X",
+    "wikipedia.org" to "Wikipedia", "discogs.com" to "Discogs",
+    "last.fm" to "Last.fm", "allmusic.com" to "AllMusic",
+)
+
+fun externalLinks(rels: List<JsonObject>): List<Pair<String, String>> =
+    rels.mapNotNull { r ->
+        val url = r.obj("url")?.get("resource").str() ?: return@mapNotNull null
+        val host = runCatching { java.net.URI(url).host?.removePrefix("www.") }.getOrNull()
+            ?: return@mapNotNull null
+        val label = LINK_LABELS.entries.firstOrNull { (k, _) -> host == k || host.endsWith(".$k") }?.value
+            ?: if (r["type"].str() == "official homepage") "Website" else return@mapNotNull null
+        label to url
+    }.distinctBy { it.second }
+        .sortedBy { (label, _) -> LINK_LABELS.values.distinct().indexOf(label).let { if (it < 0) 99 else it } }

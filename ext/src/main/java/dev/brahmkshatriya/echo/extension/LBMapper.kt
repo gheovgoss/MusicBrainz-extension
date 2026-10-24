@@ -3,10 +3,7 @@ package dev.brahmkshatriya.echo.extension
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.Track
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.*
 
 fun JsonObject.listenToTrack(): Track? {
     val tm = obj("track_metadata") ?: return null
@@ -27,7 +24,7 @@ fun JsonObject.listenToTrack(): Track? {
             id = id,
             name = o["artist_credit_name"].str() ?: artistName,
             extras = mapOf("mbid" to id),
-            isRadioSupported = false,
+            isRadioSupported = true,
             isFollowable = false,
             isSaveable = false,
         )
@@ -37,7 +34,7 @@ fun JsonObject.listenToTrack(): Track? {
         mapped.isNotEmpty() -> mapped
         artistName.isNotBlank() -> listOf(
             Artist(id = artistName, name = artistName,
-                isRadioSupported = false, isFollowable = false, isSaveable = false)
+                isRadioSupported = true, isFollowable = false, isSaveable = false)
         )
         else -> emptyList()
     }
@@ -52,7 +49,7 @@ fun JsonObject.listenToTrack(): Track? {
             cover = cover,
             artists = artists,
             extras = mapOf("mbid" to rgMbid, "kind" to "release-group"),
-            isRadioSupported = false,
+            isRadioSupported = true,
             isSaveable = false,
         )
     } else null
@@ -65,7 +62,7 @@ fun JsonObject.listenToTrack(): Track? {
         album = album,
         duration = (info?.get("duration_ms") as? JsonPrimitive)?.longOrNull,
         extras = if (mbid != null) mapOf("mbid" to mbid) else emptyMap(),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isSaveable = false,
         isHideable = false,
         isLikeable = false,
@@ -79,7 +76,7 @@ private fun creditOf(name: String?, mbids: JsonArray): List<Artist> {
             id = id,
             name = name ?: "?",
             extras = mapOf("mbid" to id),
-            isRadioSupported = false,
+            isRadioSupported = true,
             isFollowable = false,
             isSaveable = false,
         )
@@ -92,9 +89,9 @@ fun JsonObject.statArtist(): Artist? {
     return Artist(
         id = id,
         name = name,
-        subtitle = this["listen_count"].str()?.let { "$it ascolti" },
+        subtitle = this["listen_count"].str()?.let { "$it listens" },
         extras = mapOf("mbid" to id),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isFollowable = false,
         isSaveable = false,
     )
@@ -110,7 +107,7 @@ fun JsonObject.statAlbum(): Album? {
         artists = creditOf(this["artist_name"].str(), arr("artist_mbids")),
         subtitle = this["listen_count"].str()?.let { "$it ascolti" },
         extras = mapOf("mbid" to id, "kind" to "release-group"),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isSaveable = false,
     )
 }
@@ -126,7 +123,58 @@ fun JsonObject.freshAlbum(): Album? {
         subtitle = listOfNotNull(this["release_group_primary_type"].str(), this["release_date"].str())
             .joinToString(" • ").ifEmpty { null },
         extras = mapOf("mbid" to id, "kind" to "release-group"),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isSaveable = false,
+    )
+}
+
+fun JsonObject.popularTrack(fallback: Artist): Track? {
+    val id = this["recording_mbid"].str() ?: return null
+    val title = this["recording_name"].str() ?: return null
+    val artists = creditOf(this["artist_name"].str(), arr("artist_mbids")).ifEmpty { listOf(fallback) }
+    val rel = this["release_mbid"].str() ?: this["caa_release_mbid"].str()
+    return Track(
+        id = id,
+        title = title,
+        cover = rel?.let { cover("release/$it/front-250") },
+        artists = artists,
+        extras = mapOf("mbid" to id),
+        isRadioSupported = true,
+        isSaveable = false,
+        isHideable = false,
+        isLikeable = false,
+    )
+}
+
+fun JsonObject.jspfTrack(): Track? {
+    val ident = (this["identifier"] as? JsonArray)?.firstOrNull().str() ?: this["identifier"].str()
+    val mbid = ident?.substringAfterLast('/')?.takeIf { it.length == 36 } ?: return null
+    val title = this["title"].str() ?: return null
+    val ext = obj("extension")?.obj("https://musicbrainz.org/doc/jspf#track")
+    val artistMbid = (ext?.get("artist_identifiers") as? JsonArray)?.firstOrNull().str()
+        ?.substringAfterLast('/')
+    val name = this["creator"].str() ?: "?"
+    val release = ext?.get("release_identifier").str()?.substringAfterLast('/')
+
+    return Track(
+        id = mbid,
+        title = title,
+        cover = release?.let { cover("release/$it/front-250") },
+        artists = listOf(
+            Artist(
+                id = artistMbid ?: name,
+                name = name,
+                extras = artistMbid?.let { mapOf("mbid" to it) } ?: emptyMap(),
+                isRadioSupported = artistMbid != null,
+                isFollowable = false,
+                isSaveable = false,
+            )
+        ),
+        duration = (this["duration"] as? JsonPrimitive)?.longOrNull,
+        extras = mapOf("mbid" to mbid),
+        isRadioSupported = true,
+        isSaveable = false,
+        isHideable = false,
+        isLikeable = false,
     )
 }

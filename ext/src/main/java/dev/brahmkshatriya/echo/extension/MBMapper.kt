@@ -33,7 +33,7 @@ fun artistsOf(o: JsonObject): List<Artist> =
             id = id,
             name = a["name"].str() ?: c["name"].str() ?: "?",
             extras = mapOf("mbid" to id),
-            isRadioSupported = false,
+            isRadioSupported = true,
             isFollowable = false,
             isSaveable = false,
         )
@@ -52,7 +52,7 @@ fun JsonObject.toArtist(): Artist? {
         name = name,
         subtitle = subtitle,
         extras = mapOf("mbid" to id),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isFollowable = false,
         isSaveable = false,
     )
@@ -71,7 +71,7 @@ fun JsonObject.toAlbum(): Album? {
         subtitle = listOfNotNull(kinds.joinToString(" + ").ifEmpty { null }, year)
             .joinToString(" • ").ifEmpty { null },
         extras = mapOf("mbid" to id, "kind" to "release-group"),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isSaveable = false,
     )
 }
@@ -103,7 +103,7 @@ fun JsonObject.toTrack(): Track? {
             cover = releaseGroupCover(rgId),
             artists = artists,
             extras = mapOf("mbid" to rgId, "kind" to "release-group"),
-            isRadioSupported = false,
+            isRadioSupported = true,
             isSaveable = false,
         )
     } else null
@@ -119,7 +119,7 @@ fun JsonObject.toTrack(): Track? {
         duration = (this["length"] as? JsonPrimitive)?.longOrNull,
         isrc = isrc,
         extras = mapOf("mbid" to id),
-        isRadioSupported = false,
+        isRadioSupported = true,
         isSaveable = false,
         isHideable = false,
         isLikeable = false,

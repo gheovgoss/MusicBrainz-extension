@@ -5,6 +5,7 @@ import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
+import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.*
@@ -21,20 +22,23 @@ import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Album
 import dev.brahmkshatriya.echo.common.models.Artist
+import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
 
-private fun lbLog(msg: String) = println("LbExt: $msg")
+private fun lbLog(msg: String) = println("MbExt: $msg")
 
 class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
-    AlbumClient, ArtistClient, TrackClient, HomeFeedClient {
+    AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -135,7 +139,7 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                     }
                 }
             } catch (e: Exception) {
-                lbLog("lookup errore: ${e.message}")
+                lbLog("lookup error: ${e.message}")
                 null
             } ?: continue
             val mbid = runCatching {
@@ -164,7 +168,51 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     override suspend fun loadArtist(artist: Artist): Artist = mb.loadArtistDetails(artist)
 
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> =
-        PagedData.Single { mb.artistShelves(artist) }.toFeed()
+        PagedData.Single { artistFeed(artist) }.toFeed()
+
+    private suspend fun artistFeed(artist: Artist): List<Shelf> = coroutineScope {
+        val popular = async { popularTracks(artist) }
+        val links = async { mb.artistLinks(artist) }
+        val disc = async { mb.artistShelves(artist) }
+
+        val popularTracks = popular.await()
+        val linkList = links.await()
+        val discography = disc.await()
+
+        buildList {
+            if (popularTracks.isNotEmpty()) {
+                add(Shelf.Lists.Tracks(id = "popular", title = "Popular tracks", list = popularTracks))
+            }
+            if (linkList.isNotEmpty()) {
+                add(
+                    Shelf.Lists.Categories(
+                        id = "links",
+                        title = "Listen / find",
+                        list = linkList.map { (label, url) ->
+                            Shelf.Category(
+                                id = url,
+                                title = label,
+                                subtitle = url.substringAfter("://").substringBefore('/'),
+                            )
+                        }
+                    )
+                )
+            }
+            addAll(discography)
+        }
+    }
+    private suspend fun popularTracks(artist: Artist): List<Track> {
+        val mbid = artist.extras["mbid"] ?: run {
+            lbLog("popular: artista senza mbid (${artist.id})")
+            return emptyList()
+        }
+        if (token == null) lbLog("popular: no login, server can send 401")
+        val root = lbGet(lbUrl("1", "popularity", "top-recordings-for-artist", mbid))
+        lbLog("popular: keys=${root?.keys}")
+        return root?.arr("items")
+            ?.mapNotNull { (it as? JsonObject)?.popularTrack(artist) }
+            ?.take(10).orEmpty()
+    }
 
     // --- Track ---
 
@@ -253,11 +301,91 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                 if (it.isSuccessful) it.body.string()
                 else { lbLog("HTTP ${it.code} per $url"); null }
             }
-        }?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
+        }?.let { text ->
+            when (val el = runCatching { json.parseToJsonElement(text) }.getOrNull()) {
+                is JsonObject -> el
+                is JsonArray -> JsonObject(mapOf("items" to el))
+                else -> null
+            }
+        }
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
         lbLog("errore: ${e.message}")
         null
+    }
+
+    // --- Radio ---
+
+    private val slowHttp by lazy {
+        http.newBuilder()
+            .readTimeout(120, TimeUnit.SECONDS)
+            .callTimeout(130, TimeUnit.SECONDS)
+            .build()
+    }
+
+    override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio {
+        val seed: Artist? = when (item) {
+            is Artist -> item
+            is Album -> item.artists.firstOrNull()
+            is Track -> item.artists.firstOrNull()
+            else -> null
+        }
+        val artist = seed ?: error("No artist to build a radio from")
+        val title = when (item) {
+            is Artist -> "${item.name} Radio"
+            is Album -> "${item.title} Radio"
+            is Track -> "${item.title} Radio"
+            else -> "${artist.name} Radio"
+        }
+        return Radio(
+            id = "${item::class.simpleName}:${item.id}",
+            title = title,
+            cover = item.cover ?: artist.cover,
+            authors = listOf(artist),
+            extras = buildMap {
+                artist.extras["mbid"]?.let { put("mbid", it) }
+                put("name", artist.name)
+            },
+        )
+    }
+
+    override suspend fun loadRadio(radio: Radio): Radio = radio
+
+    override suspend fun loadTracks(radio: Radio): Feed<Track> =
+        PagedData.Single { radioTracks(radio) }.toFeed()
+
+    private suspend fun radioTracks(radio: Radio): List<Track> {
+        val mbid = radio.extras["mbid"]
+        val name = radio.extras["name"]
+        for (key in listOfNotNull(mbid, name).distinct()) {
+            val t = lbRadio("artist:($key)")
+            if (t.isNotEmpty()) return t
+        }
+        return emptyList()
+    }
+
+    private suspend fun lbRadio(prompt: String): List<Track> {
+        val url = lbUrl("1", "explore", "lb-radio", params = mapOf("prompt" to prompt, "mode" to "easy"))
+        val body = try {
+            withContext(Dispatchers.IO) {
+                val req = Request.Builder().url(url).apply {
+                    token?.let { header("Authorization", "Token $it") }
+                }.get().build()
+                slowHttp.newCall(req).execute().use {
+                    lbLog("lb-radio HTTP ${it.code} per $prompt")
+                    if (it.isSuccessful) it.body.string() else null
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            lbLog("lb-radio errore: ${e.message}")
+            null
+        } ?: return emptyList()
+        return runCatching {
+            json.parseToJsonElement(body).jsonObject.obj("payload")?.obj("jspf")
+                ?.obj("playlist")?.arr("track")
+        }.getOrNull()?.mapNotNull { (it as? JsonObject)?.jspfTrack() }.orEmpty()
     }
 }
