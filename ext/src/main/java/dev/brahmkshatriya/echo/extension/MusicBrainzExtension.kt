@@ -342,8 +342,18 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         fun tracks(id: String, l: List<Track>) {
             if (l.isNotEmpty()) real[id] = Shelf.Lists.Tracks(id = id, title = HOME_TITLES.getValue(id), list = l)
         }
+
+        val forYou = async {
+            withCovers(userPlaylists(user, false, "playlists", "createdfor").take(10))
+        }
+
         tracks("recent", recent.await())
         tracks("recs", recs.await())
+
+        forYou.await().takeIf { it.isNotEmpty() }?.let {
+            real["for_you"] = Shelf.Lists.Items(id = "for_you", title = HOME_TITLES.getValue("for_you"), list = it)
+        }
+
         topArtists.await().takeIf { it.isNotEmpty() }?.let {
             real["top_artists"] = Shelf.Lists.Items(id = "top_artists", title = HOME_TITLES.getValue("top_artists"), list = it)
         }

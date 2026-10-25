@@ -4,14 +4,15 @@ import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.serialization.json.JsonObject
 
-val HOME_ORDER = listOf("recent", "recs", "top_artists", "top_albums", "fresh")
+val HOME_ORDER = listOf("recent", "recs", "for_you", "top_artists", "top_albums", "fresh")
 
 val HOME_TITLES = mapOf(
-    "recent" to "Recent Playing",
-    "recs" to "Recommendations",
-    "top_artists" to "Your month's artist",
-    "top_albums" to "Your month's album",
-    "fresh" to "New music",
+    "recent" to "Recent Listens",
+    "recs" to "For You",
+    "for_you" to "Created for you",
+    "top_artists" to "Your Top Artists",
+    "top_albums" to "Your Top Albums",
+    "fresh" to "Fresh",
 )
 
 private val MOCK_ARTISTS = listOf(
