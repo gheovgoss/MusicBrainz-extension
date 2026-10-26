@@ -130,18 +130,20 @@ private val LUCENE_SPECIAL = Regex("""([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)""")
 
 fun luceneEscape(s: String): String = s.replace(LUCENE_SPECIAL, "\\\\$1")
 
-suspend fun MBClient.searchAll(query: String): List<Shelf> {
-    val q = luceneEscape(query.trim())
-    if (q.isEmpty()) return emptyList()
-
-    val artists = get("artist", mapOf("query" to q, "limit" to "5"))
+suspend fun MBClient.searchArtists(query: String, limit: Int = 12): List<Artist> {
+    val q = luceneEscape(query.trim()).ifEmpty { return emptyList() }
+    return get("artist", mapOf("query" to q, "limit" to limit.toString()))
         ?.arr("artists")?.mapNotNull { (it as? JsonObject)?.toArtist() }.orEmpty()
-    val albums = get("release-group", mapOf("query" to q, "limit" to "8"))
-        ?.arr("release-groups")?.mapNotNull { (it as? JsonObject)?.toAlbum() }.orEmpty()
-    val tracks = get("recording", mapOf("query" to q, "limit" to "15"))
-        ?.arr("recordings")?.mapNotNull { (it as? JsonObject)?.toTrack() }.orEmpty()
+}
 
-    return artists.map { Shelf.Item(it) } +
-            albums.map { Shelf.Item(it) } +
-            tracks.map { Shelf.Item(it) }
+suspend fun MBClient.searchAlbums(query: String, limit: Int = 20): List<Album> {
+    val q = luceneEscape(query.trim()).ifEmpty { return emptyList() }
+    return get("release-group", mapOf("query" to q, "limit" to limit.toString()))
+        ?.arr("release-groups")?.mapNotNull { (it as? JsonObject)?.toAlbum() }.orEmpty()
+}
+
+suspend fun MBClient.searchTracks(query: String, limit: Int = 25): List<Track> {
+    val q = luceneEscape(query.trim()).ifEmpty { return emptyList() }
+    return get("recording", mapOf("query" to q, "limit" to limit.toString()))
+        ?.arr("recordings")?.mapNotNull { (it as? JsonObject)?.toTrack() }.orEmpty()
 }

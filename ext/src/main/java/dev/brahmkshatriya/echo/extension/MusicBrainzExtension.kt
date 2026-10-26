@@ -27,11 +27,13 @@ import dev.brahmkshatriya.echo.common.models.Artist
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
 import dev.brahmkshatriya.echo.common.models.ImageHolder
 import dev.brahmkshatriya.echo.common.models.Playlist
 import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Tab
 import dev.brahmkshatriya.echo.common.models.Track
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -140,8 +142,24 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
 
     // --- Search ---
 
-    override suspend fun loadSearchFeed(query: String): Feed<Shelf> =
-        PagedData.Single { mb.searchAll(query) }.toFeed()
+    private val searchTabs = listOf(
+        Tab("artists", "Artists"),
+        Tab("albums", "Albums"),
+        Tab("tracks", "Tracks"),
+    )
+
+    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+        if (query.isBlank()) return PagedData.Single<Shelf> { emptyList() }.toFeed()
+        return Feed(searchTabs) { tab ->
+            PagedData.Single<Shelf> {
+                when (tab?.id) {
+                    "albums" -> mb.searchAlbums(query).map { Shelf.Item(it) }
+                    "tracks" -> mb.searchTracks(query).map { Shelf.Item(it) }
+                    else -> mb.withImages(mb.searchArtists(query)).map { Shelf.Item(it) }
+                }
+            }.toFeedData()
+        }
+    }
 
     // --- Album ---
     override suspend fun loadAlbum(album: Album): Album = mb.loadAlbumDetails(album)

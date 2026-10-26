@@ -1,6 +1,10 @@
 package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.models.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.net.URLDecoder
@@ -267,3 +271,29 @@ fun externalLinks(rels: List<JsonObject>): List<Pair<String, String>> =
         label to url
     }.distinctBy { it.second }
         .sortedBy { (label, _) -> LINK_LABELS.values.distinct().indexOf(label).let { if (it < 0) 99 else it } }
+
+private val artistImageCache = java.util.Collections.synchronizedMap(HashMap<String, ImageHolder?>())
+
+suspend fun MBClient.searchArtistImage(artist: Artist): ImageHolder? {
+    val mbid = artist.extras["mbid"] ?: return null
+    if (artistImageCache.containsKey(mbid)) return artistImageCache[mbid]
+
+    val a = get("artist/$mbid", mapOf("inc" to "genres+url-rels")) ?: return null
+    val rels = a.arr("relations").mapNotNull { it as? JsonObject }
+    val qid = rels.firstOrNull { it["type"].str() == "wikidata" }
+        ?.obj("url")?.get("resource").str()?.substringAfterLast('/')
+    val entity = qid?.let { wikidataEntity(it) }
+    val img = artistImage(rels, entity)
+    artistImageCache[mbid] = img
+    return img
+}
+
+suspend fun MBClient.withImages(artists: List<Artist>, max: Int = 6): List<Artist> = coroutineScope {
+    val head = artists.take(max).map { a ->
+        async {
+            val img = withTimeoutOrNull(10_000) { searchArtistImage(a) }
+            if (img != null) a.copy(cover = img, background = img) else a
+        }
+    }.awaitAll()
+    head + artists.drop(max)
+}
