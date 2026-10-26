@@ -54,10 +54,10 @@ private fun releaseTracks(rel: JsonObject, album: Album): List<Track> {
                 albumOrderNumber = (tr["position"] as? JsonPrimitive)?.longOrNull,
                 albumDiscNumber = disc,
                 extras = mapOf("mbid" to id),
-                isRadioSupported = false,
-                isSaveable = false,
-                isHideable = false,
-                isLikeable = false,
+                isRadioSupported = true,
+                isSaveable = true,
+                isHideable = true,
+                isLikeable = true,
             )
         }
     }
@@ -198,7 +198,7 @@ private fun JsonObject.p18(): String? =
     obj("claims")?.arr("P18")?.firstOrNull()?.let { it as? JsonObject }
         ?.obj("mainsnak")?.obj("datavalue")?.get("value").str()
 
-private suspend fun MBClient.artistImage(rels: List<JsonObject>, entity: JsonObject?): ImageHolder? {
+private fun MBClient.artistImage(rels: List<JsonObject>, entity: JsonObject?): ImageHolder? {
     val fromRel = rels.firstOrNull { it["type"].str() == "image" }
         ?.obj("url")?.get("resource").str()
         ?.substringAfter("File:", "")?.takeIf { it.isNotBlank() }
@@ -227,26 +227,17 @@ private suspend fun MBClient.wikipediaExtract(entity: JsonObject): String? {
     }
     return null
 }
-private suspend fun MBClient.commonsThumb(file: String): ImageHolder? {
-    val api = "https://commons.wikimedia.org/w/api.php".toHttpUrl().newBuilder()
-        .addQueryParameter("action", "query")
-        .addQueryParameter("titles", "File:$file")
-        .addQueryParameter("prop", "imageinfo")
-        .addQueryParameter("iiprop", "url")
-        .addQueryParameter("iiurlwidth", "800")
-        .addQueryParameter("format", "json")
-        .build().toString()
-    val page = getExternal(api)?.obj("query")?.obj("pages")?.values?.firstOrNull() as? JsonObject
-    val info = page?.arr("imageinfo")?.firstOrNull() as? JsonObject
-    val url = info?.get("thumburl").str() ?: info?.get("url").str()
-    mbLog("immagine artista: file=$file url=$url")
-    return url?.let {
-        ImageHolder.NetworkRequestImageHolder(
-            NetworkRequest(url = it, headers = mapOf("User-Agent" to currentUserAgent())),
-            false
-        )
-    }
-}
+private fun MBClient.commonsThumb(file: String): ImageHolder =
+    ImageHolder.NetworkRequestImageHolder(
+        NetworkRequest(
+            url = "https://commons.wikimedia.org/wiki/Special:FilePath/".toHttpUrl().newBuilder()
+                .addPathSegment(file.replace(' ', '_'))
+                .addQueryParameter("width", "500")
+                .build().toString(),
+            headers = mapOf("User-Agent" to currentUserAgent())
+        ),
+        false
+    )
 
 //EXTERNAL LINKS
 
@@ -260,6 +251,25 @@ private val LINK_LABELS = linkedMapOf(
     "wikipedia.org" to "Wikipedia", "discogs.com" to "Discogs",
     "last.fm" to "Last.fm", "allmusic.com" to "AllMusic",
 )
+
+fun linkIcon(url: String): ImageHolder? {
+    val host = runCatching { java.net.URI(url).host?.removePrefix("www.") }.getOrNull()
+        ?: return null
+    return ImageHolder.NetworkRequestImageHolder(
+        NetworkRequest(url = "https://www.google.com/s2/favicons?domain=$host&sz=128"),
+        false
+    )
+}
+
+private val LINK_COLORS = mapOf(
+    "Spotify" to "#1DB954", "Deezer" to "#A238FF", "YouTube Music" to "#FF0000",
+    "YouTube" to "#FF0000", "Apple Music" to "#FA243C", "Tidal" to "#000000",
+    "Bandcamp" to "#1DA0C3", "SoundCloud" to "#FF5500", "Instagram" to "#E1306C",
+    "Facebook" to "#1877F2", "X" to "#000000", "Wikipedia" to "#636466",
+    "Discogs" to "#333333", "Last.fm" to "#D51007", "AllMusic" to "#1E90FF",
+)
+
+fun linkColor(label: String): String? = LINK_COLORS[label]
 
 fun externalLinks(rels: List<JsonObject>): List<Pair<String, String>> =
     rels.mapNotNull { r ->

@@ -20,6 +20,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
+import dev.brahmkshatriya.echo.common.clients.ShareClient
 import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.PagedData
 import dev.brahmkshatriya.echo.common.models.Album
@@ -53,7 +54,7 @@ private fun lbLog(msg: String) = println("MbExt: $msg")
 
 class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFeedClient,
     AlbumClient, ArtistClient, TrackClient, HomeFeedClient, RadioClient, LibraryFeedClient,
-    PlaylistClient, PlaylistEditPrivacyClient, LikeClient, HideClient {
+    PlaylistClient, PlaylistEditPrivacyClient, LikeClient, HideClient, ShareClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
@@ -176,6 +177,16 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> =
         PagedData.Single { artistFeed(artist) }.toFeed()
 
+    private fun linkPage(label: String, url: String): List<Shelf> = listOf(
+        Shelf.Category(
+            id = "open:$url",
+            title = url,
+            subtitle = label,
+            image = linkIcon(url),
+            backgroundColor = linkColor(label),
+        )
+    )
+
     private suspend fun artistFeed(artist: Artist): List<Shelf> = coroutineScope {
         val popular = async { popularTracks(artist) }
         val links = async { mb.artistLinks(artist) }
@@ -199,6 +210,10 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                                 id = url,
                                 title = label,
                                 subtitle = url.substringAfter("://").substringBefore('/'),
+                                image = linkIcon(url),
+                                backgroundColor = linkColor(label),
+                                extras = mapOf("url" to url),
+                                feed = PagedData.Single { linkPage(label, url) }.toFeed(),
                             )
                         }
                     )
@@ -229,7 +244,17 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
         isDownload: Boolean,
     ): Streamable.Media = error("No stream audio from MB")
 
-    override suspend fun loadFeed(track: Track): Feed<Shelf>? = null
+    override suspend fun loadFeed(track: Track): Feed<Shelf> =
+        PagedData.Single{ trackInfo(track) }.toFeed()
+
+    private fun trackInfo(track: Track): List<Shelf> = buildList {
+        quickMbid(track)?.let {
+            add(Shelf.Category(id = "mbid", title = "MusicBrainz ID", subtitle = it))
+        }
+        track.isrc?.let {
+            add(Shelf.Category(id = "isrc", title = "ISRC", subtitle = it))
+        }
+    }
 
     // --- Like / Hide---
 
@@ -800,5 +825,18 @@ class MusicBrainzExtension : LoginClient.CustomInput, ExtensionClient, SearchFee
                 p to has
             }
         }.awaitAll()
+    }
+
+    // --- SHARE ---
+
+    override suspend fun onShare(item: EchoMediaItem): String {
+        val mbid = item.extras["mbid"] ?: item.id
+        return when (item) {
+            is Track -> "https://musicbrainz.org/recording/$mbid"
+            is Artist -> "https://musicbrainz.org/artist/$mbid"
+            is Album -> "https://musicbrainz.org/release-group/$mbid"
+            is Playlist -> "https://listenbrainz.org/playlist/${item.id}"
+            else -> error("Cannot share this item")
+        }
     }
 }
